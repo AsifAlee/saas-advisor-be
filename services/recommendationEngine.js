@@ -1,8 +1,10 @@
 const Platform = require('../models/Platform');
 const Question = require('../models/Question');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 /**
  * Calculates the best platform based on user answers using a scoring heuristic
+ * and generates a personalized explanation using Gemini AI.
  * @param {Array<{questionId: String, value: String}>} answers 
  * @returns {Promise<Object>} The recommended platform
  */
@@ -17,15 +19,22 @@ async function getRecommendation(answers) {
 
     // 1. Initialize scores for tags based on user answers
     const tagScores = {};
+    const userSummary = [];
 
     answers.forEach(answer => {
       const question = questions.find(q => q.id === answer.questionId);
       if (!question) return;
 
       const selectedOption = question.options.find(o => o.value === answer.value);
-      if (!selectedOption || !selectedOption.scoreAdjustments) return;
+      if (!selectedOption) return;
 
-      // selectedOption.scoreAdjustments is a Map in Mongoose, but we can treat it like an object/iterator
+      userSummary.push({
+        question: question.text,
+        answer: selectedOption.text
+      });
+
+      if (!selectedOption.scoreAdjustments) return;
+
       const adjustments = selectedOption.scoreAdjustments instanceof Map 
         ? Object.fromEntries(selectedOption.scoreAdjustments) 
         : selectedOption.scoreAdjustments;
@@ -50,12 +59,38 @@ async function getRecommendation(answers) {
     platformsWithScores.sort((a, b) => b.score - a.score);
 
     const winner = platformsWithScores[0].platform;
-    const secondPlace = platformsWithScores[1]?.platform;
 
-    // 4. Generate a simple reason
-    let reason = `Based on your needs, ${winner.name} scored the highest match (${platformsWithScores[0].score} points).`;
-    if (secondPlace) {
-      reason += ` It narrowly beat out ${secondPlace.name} to be your top choice.`;
+    // 4. Generate a personalized reason using Gemini
+    let reason = `Based on your needs, ${winner.name} is the best match for you.`;
+    
+    try {
+      const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+      const prompt = `
+        You are a SaaS advisor expert. Based on the user's answers to a questionnaire and the selected tool, provide a concise (2-3 sentences) personalized explanation of why this tool is the best fit for them.
+        
+        User Answers:
+        ${userSummary.map(s => `- ${s.question}: ${s.answer}`).join('\n')}
+        
+        Recommended Tool:
+        Name: ${winner.name}
+        Description: ${winner.description}
+        Features: ${winner.features.join(', ')}
+        
+        Provide the explanation in a friendly, professional tone.
+      `;
+
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
+      
+      if (text) {
+        reason = text.trim();
+      }
+    } catch (aiError) {
+      console.error("Gemini AI Error:", aiError);
+      // Fallback to simple reason if AI fails
     }
 
     return { 
@@ -64,8 +99,7 @@ async function getRecommendation(answers) {
     };
 
   } catch (error) {
-    console.error("Error in heuristic recommendation engine:", error);
-    // Ultimate fallback if something fails
+    console.error("Error in recommendation engine:", error);
     const fallbackPlatforms = await Platform.find({});
     if (fallbackPlatforms.length > 0) {
       return { 
